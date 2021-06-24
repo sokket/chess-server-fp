@@ -55,6 +55,7 @@ process (accepted, address) channel logChannel = do
           logMsg "Connected"
           handleLobby accepted channel logMsg
           logMsg "Disconnected"
+          close accepted
     Nothing -> do
       logMsg "REJECTED"
       close accepted
