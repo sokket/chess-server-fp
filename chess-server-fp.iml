@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="HASKELL_MODULE" version="4">
+  <component name="FacetManager">
+    <facet type="Python" name="Python">
+      <configuration sdkName="Python 3.9 (chess-server-fp)" />
+    </facet>
+  </component>
   <component name="NewModuleRootManager" inherit-compiler-output="true">
     <exclude-output />
     <content url="file://$MODULE_DIR$">
@@ -21,5 +26,6 @@
     <orderEntry type="library" name="utf8-string-1.0.2" level="project" />
     <orderEntry type="library" name="random-1.1" level="project" />
     <orderEntry type="library" name="time-1.9.3" level="project" />
+    <orderEntry type="library" name="Python 3.9 (chess-server-fp) interpreter library" level="application" />
   </component>
 </module>

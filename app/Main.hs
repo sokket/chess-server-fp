@@ -111,7 +111,7 @@ handleLobby sock sendChannel logMsg = do
             _ <- sendByte clientSock 6 -- PKG_CLIENT_JOINED
             _ <- sendByte clientSock 0 -- isWhite
             -- Run game
-            handleGame sock clientSock
+            handleGame sock clientSock (roomLogMsgProvider joinCode)
           Nothing -> do
             killThread chanFilterThread
             logMsg "Nobody joined to the room during 1 minute"
@@ -124,17 +124,22 @@ handleLobby sock sendChannel logMsg = do
         case otherSockMaybe of
           Just otherSock -> do
             logMsg ("Joined to the room with code '" ++ BSU.toString joinCode ++ "'")
-            handleGame sock otherSock
+            handleGame sock otherSock (roomLogMsgProvider (BSU.toString joinCode))
           Nothing -> do
             logMsg "Can't join room during 2s"
       -- Invalid package
       _ -> return ()
+  where
+    roomLogMsgProvider roomCode =
+      \message -> logMsg ("[" ++ roomCode ++ "] " ++ message)
 
-handleGame :: Socket -> Socket -> IO ()
-handleGame player1 player2 = fix $ \loop -> do
+handleGame :: Socket -> Socket -> (String -> IO ()) -> IO ()
+handleGame player1 player2 logMsg = fix $ \loop -> do
   command <- recv player1 1
 
   let transmit pkgType len = sendByte player2 pkgType >> recv player1 len >>= (void . send player2)
+  let ping = sendByte player2 6 >> logMsg "ping"
+  let pong = sendByte player2 7 >> logMsg "pong"
   let transmitChat =
         sendByte player2 100
           >> fix
@@ -151,6 +156,8 @@ handleGame player1 player2 = fix $ \loop -> do
       3 -> transmit 3 1 -- CASTLING(3), LEN(1)
       4 -> transmit 4 2 -- EN_PASSANT(4), LEN(2)
       5 -> transmit 5 3 -- PROMOTION(5), LEN(3)
+      6 -> ping -- PING(6), LEN(0)
+      7 -> pong -- PONG(7), LEN(0)
       100 -> transmitChat
       _ -> return ()
     loop

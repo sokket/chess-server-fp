@@ -1,6 +1,7 @@
 module Main where
 
 import Control.Concurrent
+import Control.Monad (void, when)
 import Control.Monad.Fix (fix)
 import qualified Data.ByteString as BS (ByteString, head, length)
 import Data.ByteString.UTF8 as BSU (fromString, toString)
@@ -23,32 +24,44 @@ main = do
   setSocketOption sock ReuseAddr 1
   bind sock (SockAddrInet 8081 0)
   listen sock 4000
+  putStrLn "Server started"
   roomJoinChannel <- newChan
-  _ <- forkIO $
-    fix $ \loop -> do
-      _ <- readChan roomJoinChannel
-      loop
-  fix $ \loop -> do
-    accepted <- accept sock
-    _ <- forkIO $ process accepted roomJoinChannel
-    loop
+  logChannel <- newChan
 
-process :: (Socket, SockAddr) -> Chan Msg -> IO ()
-process (accepted, _) channel = do
+  _ <- forkIO $
+    fix $ \loop ->
+      readChan logChannel >>= putStrLn >> loop
+
+  _ <- forkIO $
+    fix $ \loop -> readChan roomJoinChannel >> loop
+
+  fix $ \loop ->
+    accept sock
+      >>= ( \accepted ->
+              forkIO $ process accepted roomJoinChannel logChannel
+          )
+      >> loop
+
+process :: (Socket, SockAddr) -> Chan Msg -> Chan String -> IO ()
+process (accepted, address) channel logChannel = do
   headerFromClient <- timeout 3000000 (recv accepted (BS.length protoHeader))
   case headerFromClient of
     Just s ->
       if s /= protoHeader
         then do
-          putStrLn ("Invalid header: " ++ show s)
+          logMsg ("Invalid header: " ++ show s)
           close accepted
         else do
-          putStrLn "Connected"
-          handleLobby accepted channel
-          putStrLn "Disconnected"
+          logMsg "Connected"
+          handleLobby accepted channel logMsg
+          logMsg "Disconnected"
+          close accepted
     Nothing -> do
-      putStrLn "REJECTED"
+      logMsg "REJECTED"
       close accepted
+  where
+    logMsg :: String -> IO ()
+    logMsg msg = writeChan logChannel ("[" ++ show address ++ "] " ++ msg)
 
 sendByte :: Socket -> Int -> IO Int
 sendByte sock a = send sock (BSU.fromString [chr a])
@@ -65,69 +78,86 @@ genJoinCodeExec generated = case len of
     genJoinCodeExec (generated ++ [charset !! index])
   where
     len = length generated
-    charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" :: [Char]
+    charset = ['a' .. 'z'] ++ ['A' .. 'Z'] ++ ['0' .. '9'] :: [Char]
 
-handleLobby :: Socket -> Chan Msg -> IO ()
-handleLobby sock sendChannel = do
+handleLobby :: Socket -> Chan Msg -> (String -> IO ()) -> IO ()
+handleLobby sock sendChannel logMsg = do
   recvChannel <- dupChan sendChannel
   command <- recv sock 1
-  case BS.head command of
-    -- PKG_CREATE_ROOM Create room
-    0 -> do
-      joinCode <- genJoinCode
-      putStrLn joinCode
-      _ <- sendByte sock 0 -- PKG_CLIENT_CODE
-      _ <- send sock (BSU.fromString joinCode)
-      -- Wait for join
-      fix $ \waitForJoin -> do
-        (code, clientSock, callback) <- readChan recvChannel
-        if code == joinCode
-          then do
+  when (BS.length command /= 0) $
+    case BS.head command of
+      -- PKG_CREATE_ROOM Create room
+      0 -> do
+        joinCode <- genJoinCode
+        logMsg ("Room '" ++ joinCode ++ "' created")
+        _ <- sendByte sock 0 -- PKG_CLIENT_CODE
+        _ <- send sock (BSU.fromString joinCode)
+        -- Wait for join
+        clientSockChan <- newChan
+        chanFilterThread <- forkIO $
+          fix $ \waitForJoin -> do
+            (code, clientSock, callback) <- readChan recvChannel
+            if code == joinCode
+              then do
+                writeChan callback sock
+                writeChan clientSockChan clientSock
+              else waitForJoin
+
+        clientSockMaybe <- timeout (60 * 1000000) (readChan clientSockChan)
+        case clientSockMaybe of
+          Just clientSock -> do
             _ <- sendByte sock 1 -- PKG_CLIENT_ROOM_FULL
             -- Send joined command
-            writeChan callback sock
             _ <- sendByte clientSock 6 -- PKG_CLIENT_JOINED
             _ <- sendByte clientSock 0 -- isWhite
             -- Run game
-            handleGame sock clientSock
-          else -- Continue waiting
-            waitForJoin
-    -- PKG_JOIN_ROOM Join room
-    1 -> do
-      joinCode <- recv sock 7
-      callback <- newChan
-      writeChan sendChannel (BSU.toString joinCode, sock, callback)
-      otherSock <- readChan callback
-      handleGame sock otherSock
-    -- Invalid package
-    _ -> return ()
+            handleGame sock clientSock (roomLogMsgProvider joinCode)
+          Nothing -> do
+            killThread chanFilterThread
+            logMsg "Nobody joined to the room during 1 minute"
+      -- PKG_JOIN_ROOM Join room
+      1 -> do
+        joinCode <- recv sock 7
+        callback <- newChan
+        writeChan sendChannel (BSU.toString joinCode, sock, callback)
+        otherSockMaybe <- timeout 2000000 (readChan callback)
+        case otherSockMaybe of
+          Just otherSock -> do
+            logMsg ("Joined to the room with code '" ++ BSU.toString joinCode ++ "'")
+            handleGame sock otherSock (roomLogMsgProvider (BSU.toString joinCode))
+          Nothing -> do
+            logMsg "Can't join room during 2s"
+      -- Invalid package
+      _ -> return ()
+  where
+    roomLogMsgProvider roomCode =
+      \message -> logMsg ("[" ++ roomCode ++ "] " ++ message)
 
-handleGame :: Socket -> Socket -> IO ()
-handleGame player1 player2 = fix $ \loop -> do
+handleGame :: Socket -> Socket -> (String -> IO ()) -> IO ()
+handleGame player1 player2 logMsg = fix $ \loop -> do
   command <- recv player1 1
 
-  let transmit pkgType len = sendByte player2 pkgType >> recv player1 len >>= send player2 >> return ()
-  let transmitChat = do
-        _ <- sendByte player2 100
-        fix $ \chatLoop -> do
-          char <- recv player1 1
-          if BS.head char /= 0
-            then do
-              _ <- send player2 char
-              chatLoop
-            else do
-              _ <- sendByte player2 0
-              return ()
-        return ()
+  let transmit pkgType len = sendByte player2 pkgType >> recv player1 len >>= (void . send player2)
+  let ping = sendByte player2 6 >> logMsg "ping"
+  let pong = sendByte player2 7 >> logMsg "pong"
+  let transmitChat =
+        sendByte player2 100
+          >> fix
+            ( \chatLoop ->
+                recv player1 1 >>= \char ->
+                  if BS.length char /= 0 && BS.head char /= 0
+                    then send player2 char >> chatLoop
+                    else void $ sendByte player2 0
+            )
 
-  if BS.length command == 0
-    then return ()
-    else do
-      case BS.head command of
-        2 -> transmit 2 4 -- MOVE(2), LEN(4)
-        3 -> transmit 3 1 -- CASTLING(3), LEN(1)
-        4 -> transmit 4 2 -- EN_PASSANT(4), LEN(2)
-        5 -> transmit 5 3 -- PROMOTION(5), LEN(3)
-        100 -> transmitChat
-        _ -> return ()
-      loop
+  when (BS.length command /= 0) $ do
+    case BS.head command of
+      2 -> transmit 2 4 -- MOVE(2), LEN(4)
+      3 -> transmit 3 1 -- CASTLING(3), LEN(1)
+      4 -> transmit 4 2 -- EN_PASSANT(4), LEN(2)
+      5 -> transmit 5 3 -- PROMOTION(5), LEN(3)
+      6 -> ping -- PING(6), LEN(0)
+      7 -> pong -- PONG(7), LEN(0)
+      100 -> transmitChat
+      _ -> return ()
+    loop
